@@ -11,7 +11,6 @@ calculator:
 | Files are saved | as they are copied | about 1.5 s after the computer stops writing |
 | Free space shown | the calculator's real figure | about half of it (see below) |
 | `NspireLogs.zip` | works (built on request) | empty, as on the calculator |
-| Tried on a real CX II-T | not yet | yes (the earlier builds) |
 
 Either mode can show the **whole calculator** or only **My Documents**.
 
