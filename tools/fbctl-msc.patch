@@ -1,0 +1,159 @@
+--- a/headless/fbctl.cpp
++++ b/headless/fbctl.cpp
+@@ -1,3 +1,5 @@
++#include <unistd.h>
++#include <ctime>
+ // fbctl - scriptable headless Firebird front end (for testing Ndless programs without a GUI).
+ //
+ //   fbctl --create-flash OUT --manuf F --boot2 F --diags F --installer F     (CX II flash image)
+@@ -35,10 +37,24 @@
+ #include "core/usblink.h"
+ #include "core/usblink_queue.h"
+ #include "keymap.h"
++#include "core/usb.h"
++#include "core/usb_cx2.h"
++#include "core/usblink_cx2.h"
++#include "core/usbmsc_host.h"
++#include "core/interrupt.h"
++
+ 
+ static FILE *cmd_file = nullptr;
+ static std::string cmd_path;
+ static long long vtime = 0, wait_until = 0;
++extern "C" uint32_t (*rtc_time_hook)(void);
++/* Real-time clock for the calculator. Frozen by default: with a running clock
++   the OS drops the TI link after ~20 s without the keep-alives that real TI
++   software sends and Firebird's link does not. "rtc 1" lets it run with
++   emulated time, without a jump. */
++static uint32_t rtc_base, rtc_frozen;
++static bool rtc_running;
++static uint32_t emulated_seconds() { return rtc_running ? rtc_base + (uint32_t)(vtime / 1000) : rtc_frozen; }
+ static int prof_left;                   /* "prof MS": program counter samples still to take */
+ static std::vector<std::string> prof_lines;  /* pc lr mode, then code-like words from the stack */
+ static std::string prof_file = "prof.txt";
+@@ -124,6 +140,10 @@
+     fflush(stdout);
+ }
+ 
++static void ep0_print(uint8_t ep, const uint8_t *d, size_t n) {
++    if (ep == 1) { usblink_cx2_handle_packet(d, n); return; }
++    printf("[ep%d data %u]\n", ep, (unsigned)n);
++}
+ static void usb_progress(int progress, void *) {
+     if (progress < 0 || progress == 100) {
+         printf("[usb done %d at %lld ms]\n", progress, vtime);
+@@ -155,9 +175,31 @@
+         if (vtime >= it->at) { set_key(it->key, false); it = releases.erase(it); }
+         else ++it;
+     }
+-    while (vtime >= wait_until && usb_busy == 0) {
++    {   /* a TI link request that never finishes must not block the script */
++        static long long busy_since = -1;
++        if (usb_busy == 0) busy_since = -1;
++        else if (busy_since < 0) busy_since = vtime;
++        else if (vtime - busy_since > 30000) {
++            printf("[usb watchdog: gisr=%x,%x,%x gimr1=%x fifo=%d,%d,%d,%d fdma=%x,%x,%x dmasr=%x dmamr=%x devaddr=%x epin0=%x epout0=%x]\n",
++                   usb_cx2.gisr[0], usb_cx2.gisr[1], usb_cx2.gisr[2], usb_cx2.gimr[1],
++                   usb_cx2.fifo[0].size, usb_cx2.fifo[1].size, usb_cx2.fifo[2].size, usb_cx2.fifo[3].size,
++                   usb_cx2.fdma[0].ctrl, usb_cx2.fdma[1].ctrl, usb_cx2.fdma[2].ctrl, usb_cx2.dmasr, usb_cx2.dmamr,
++                   usb_cx2.devaddr, usb_cx2.epin[0], usb_cx2.epout[0]);
++            fflush(stdout);
++            usb_busy = 0;
++            busy_since = -1;
++        }
++    }
++    while (vtime >= wait_until && usb_busy == 0 && usbmsc_busy == 0) {
+         std::string line;
+-        if (!read_line(line)) return;
++        if (!read_line(line)) {
++            /* The script has no next command yet (a test is deciding what to do).
++               Hold emulated time instead of letting minutes of it race by:
++               the calculator must not, for instance, switch itself off meanwhile. */
++            if (!releases.empty() || prof_left > 0) return;
++            usleep(500);
++            continue;
++        }
+         char a[512] = "", b[512] = "", cmd[32] = "";
+         int n = sscanf(line.c_str(), "%31s %511s %511s", cmd, a, b);
+         if (n < 1 || cmd[0] == '#') continue;
+@@ -181,6 +223,13 @@
+             for (int r = 0; r < 16; r++) printf(" r%d=%08x", r, arm.reg[r]);
+             printf(" cpsr=%08x]\n", arm.cpsr_low28);
+         }
++        else if (c == "pte") {           /* pte VADDR: how the OS maps an address (hex) */
++            uint32_t va = (uint32_t)strtoul(a, nullptr, 16);
++            uint32_t *l1 = (uint32_t *)phys_mem_ptr((arm.translation_table_base & ~0x3fffu) + (va >> 20) * 4, 4);
++            uint32_t e1 = l1 ? *l1 : 0, e2 = 0;
++            if ((e1 & 3) == 1) { uint32_t *l2 = (uint32_t *)phys_mem_ptr((e1 & ~0x3ffu) + ((va >> 12) & 0xff) * 4, 4); e2 = l2 ? *l2 : 0; }
++            printf("[pte %08x: ttbr=%08x control=%08x l1=%08x l2=%08x]\n", va, arm.translation_table_base, arm.control, e1, e2);
++        }
+         else if (c == "peek") {          /* peek ADDR COUNT: memory words */
+             uint32_t addr = (uint32_t)strtoul(a, nullptr, 16);
+             int count = n >= 3 ? atoi(b) : 16;
+@@ -216,6 +265,57 @@
+         else if (c == "snap") { printf("[snapshot %s: %s]\n", a, emu_suspend(a) ? "ok" : "FAILED"); }
+         else if (c == "saveflash") { printf("[flash save %s]\n", flash_save_changes() ? "ok" : "FAILED"); }
+         else if (c == "echo") { printf("%s\n", line.c_str() + 5); }
++        else if (c == "msc") usbmsc_command(line.c_str());
++        else if (c == "dump") {         /* dump ADDR LEN FILE (hex addr/len) */
++            char f3[512] = "";
++            sscanf(line.c_str(), "%*s %*s %*s %511s", f3);
++            uint32_t addr = (uint32_t)strtoul(a, nullptr, 16), len = (uint32_t)strtoul(b, nullptr, 16);
++            FILE *f = fopen(f3, "wb");
++            for (uint32_t k = 0; f && k < len; k += 4) {
++                uint32_t *w = (uint32_t *)virt_mem_ptr(addr + k, 4);
++                uint32_t v = w ? *w : 0;
++                fwrite(&v, 4, 1, f);
++            }
++            if (f) fclose(f);
++            printf("[dumped %08x+%x to %s]\n", addr, len, f3);
++        }
++        else if (c == "findhex") {      /* findhex HEXBYTES: byte sequence anywhere in RAM */
++            std::string h = a; std::vector<uint8_t> pat;
++            for (size_t i = 0; i + 1 < h.size(); i += 2) pat.push_back((uint8_t)strtoul(h.substr(i, 2).c_str(), nullptr, 16));
++            printf("[findhex:");
++            int hits = 0;
++            for (uint32_t addr = 0x10000000u; addr < 0x14000000u - pat.size() && hits < 16; addr++) {
++                uint8_t *q = (uint8_t *)virt_mem_ptr(addr, pat.size());
++                if (q && !memcmp(q, pat.data(), pat.size())) { printf(" %08x", addr); hits++; }
++            }
++            printf("]\n");
++        }
++        else if (c == "findw") {        /* findw HEX: aligned words equal to HEX in RAM */
++            uint32_t want = (uint32_t)strtoul(a, nullptr, 16);
++            printf("[findw %08x:", want);
++            int hits = 0;
++            for (uint32_t addr = 0x10000000u; addr < 0x14000000u && hits < 64; addr += 4) {
++                uint32_t *w = (uint32_t *)virt_mem_ptr(addr, 4);
++                if (w && *w == want) { printf(" %08x", addr); hits++; }
++            }
++            printf("]\n");
++        }
++        else if (c == "usbregs") {
++            printf("[usbregs imr=%x devctrl=%x devaddr=%x phy=%x gimr_all=%x gimr=%x,%x,%x gisr=%x,%x,%x epin=%x epout=%x epmap=%x fifomap=%x fifocfg=%x dmamr=%x dmasr=%x otgcs=%x otgier=%x otgisr=%x fifo=%d,%d,%d,%d cx=%d fdma=%x,%x,%x vicmask=%x]\n",
++                usb_cx2.imr, usb_cx2.devctrl, usb_cx2.devaddr, usb_cx2.phytest, usb_cx2.gimr_all, usb_cx2.gimr[0], usb_cx2.gimr[1], usb_cx2.gimr[2],
++                usb_cx2.gisr[0], usb_cx2.gisr[1], usb_cx2.gisr[2], usb_cx2.epin[0], usb_cx2.epout[0], usb_cx2.epmap[0], usb_cx2.fifomap, usb_cx2.fifocfg,
++                usb_cx2.dmamr, usb_cx2.dmasr, usb_cx2.otgcs, usb_cx2.otgier, usb_cx2.otgisr, usb_cx2.fifo[0].size, usb_cx2.fifo[1].size, usb_cx2.fifo[2].size, usb_cx2.fifo[3].size, usb_cx2.cxfifo.size,
++                usb_cx2.fdma[0].ctrl, usb_cx2.fdma[1].ctrl, usb_cx2.fdma[2].ctrl, intr.mask[0]);
++        }
++        else if (c == "rtc") { rtc_frozen = emulated_seconds(); rtc_running = atoi(a) != 0; rtc_base = rtc_frozen - (uint32_t)(vtime / 1000); }   /* rtc 1: emulated time, rtc 0: host clock */
++        else if (c == "usbtrace") { usb_cx2_trace = atoi(a); usb_cx2_host_hook = ep0_print; }
++        else if (c == "setup") {   /* setup TYPE REQ VALUE INDEX LENGTH (hex) */
++            unsigned t, r, v, ix, l;
++            if (sscanf(line.c_str(), "%*s %x %x %x %x %x", &t, &r, &v, &ix, &l) == 5) {
++                struct usb_setup p = {(uint8_t)t, (uint8_t)r, (uint16_t)v, (uint16_t)ix, (uint16_t)l};
++                usb_cx2_receive_setup_packet(&p);
++            }
++        }
+         else if (c == "quiet") quiet_debug = atoi(a) != 0;
+         else if (c == "quit") { printf("[quit at %lld ms]\n", vtime); fflush(stdout); exit(0); }
+         else printf("[unknown command %s]\n", cmd);
+@@ -281,6 +381,8 @@
+ }
+ 
+ int main(int argc, char *argv[]) {
++    rtc_frozen = (uint32_t)time(nullptr);
++    rtc_time_hook = emulated_seconds;
+     const char *boot1 = nullptr, *flash = nullptr, *snapshot = nullptr, *cmds = nullptr;
+     const char *create = nullptr, *manuf = nullptr, *boot2 = nullptr, *diags = nullptr, *installer = nullptr;
+     for (int i = 1; i < argc; ++i) {

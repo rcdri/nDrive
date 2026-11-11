@@ -1,0 +1,21 @@
+diff --git a/src/usb.c b/src/usb.c
+index 10036e8..fbbdb69 100644
+--- a/src/usb.c
++++ b/src/usb.c
+@@ -51,8 +51,14 @@ int usb_get_device(usb_device_t *handle, uint16_t vid, uint16_t pid) {
+ 	/* Libusb boilerplate */
+ 	if (!(dev = libusb_open_device_with_vid_pid(usb_ctx, vid, pid)))
+ 		goto error;
+-	if (libusb_set_configuration(dev, NSP_DEFAULT_CONFIG))
+-		goto error_close;
++	/* With nDrive the calculator also has a mass storage interface that the
++	 * kernel's storage driver holds; the kernel then refuses to set the
++	 * configuration again. That is fine if it is already the active one. */
++	if (libusb_set_configuration(dev, NSP_DEFAULT_CONFIG)) {
++		int active = 0;
++		if (libusb_get_configuration(dev, &active) || active != NSP_DEFAULT_CONFIG)
++			goto error_close;
++	}
+ 	if (libusb_reset_device(dev))
+ 		goto error_close;
+ 	if (libusb_claim_interface(dev, NSP_DEFAULT_IFACE))

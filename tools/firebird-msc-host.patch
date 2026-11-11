@@ -1,0 +1,845 @@
+diff --git a/core/cpu.cpp b/core/cpu.cpp
+index e1c56c1..554333d 100644
+--- a/core/cpu.cpp
++++ b/core/cpu.cpp
+@@ -130,6 +130,7 @@ void prefetch_abort(uint32_t mva, uint8_t status)
+ 
+ void data_abort(uint32_t mva, uint8_t status)
+ {
++    printf("[data abort at %08x status %x pc %08x]\n", mva, status, arm.reg[15]);
+     fix_pc_for_fault();
+     warn("Data abort: address=%08x status=%02x instruction at %08x\n", mva, status, arm.reg[15]);
+     arm.reg[15] += 8;
+diff --git a/core/emu.cpp b/core/emu.cpp
+index 2ab6456..2f686d6 100644
+--- a/core/emu.cpp
++++ b/core/emu.cpp
+@@ -107,6 +107,7 @@ void return_to_loop()
+ }
+ 
+ extern "C" void usblink_timer();
++void usbmsc_host_timer();
+ 
+ // Store the last time the throttle event happened
+ static auto last_throttle = std::chrono::steady_clock::now();
+@@ -123,6 +124,7 @@ void throttle_interval_event(int index)
+     const auto virt_throttle_interval = std::chrono::milliseconds(10);
+ 
+     usblink_timer();
++    usbmsc_host_timer();
+ 
+     usblink_queue_do();
+ 
+diff --git a/core/misc.c b/core/misc.c
+index e85aff5..302ecaa 100644
+--- a/core/misc.c
++++ b/core/misc.c
+@@ -381,6 +381,9 @@ void unknown_9008_write(uint32_t addr, uint32_t value) {
+ 
+ /* 90090000 */
+ struct rtc_state rtc;
++/* Test harness: seconds of emulated time instead of the host's clock. */
++uint32_t (*rtc_time_hook)(void);
++static uint32_t rtc_now(void) { return rtc_time_hook ? rtc_time_hook() : (uint32_t)time(NULL); }
+ 
+ void rtc_reset() {
+     rtc.offset = 0;
+@@ -388,7 +391,7 @@ void rtc_reset() {
+ 
+ uint32_t rtc_read(uint32_t addr) {
+     switch (addr & 0xFFFF) {
+-        case 0x00: return time(NULL) - rtc.offset;
++        case 0x00: return rtc_now() - rtc.offset;
+         case 0x14: return 0;
+         case 0xFE0: return 0x31;
+         case 0xFE4: return 0x10;
+@@ -400,7 +403,7 @@ uint32_t rtc_read(uint32_t addr) {
+ void rtc_write(uint32_t addr, uint32_t value) {
+     switch (addr & 0xFFFF) {
+         case 0x04: return;
+-        case 0x08: rtc.offset = time(NULL) - value; return;
++        case 0x08: rtc.offset = rtc_now() - value; return;
+         case 0x0C: return;
+         case 0x10: return;
+         case 0x1C: return;
+diff --git a/core/usb_cx2.cpp b/core/usb_cx2.cpp
+index 1913e1b..7154dc4 100644
+--- a/core/usb_cx2.cpp
++++ b/core/usb_cx2.cpp
+@@ -7,8 +7,35 @@
+ #include "usb_cx2.h"
+ #include "usblink_cx2.h"
+ #include "interrupt.h"
++#include "cpu.h"
+ 
+ usb_cx2_state usb_cx2;
++int usb_cx2_trace = 0;
++void (*usb_cx2_host_hook)(uint8_t ep, const uint8_t *data, size_t size) = nullptr;
++static void usb_cx2_int_check();
++void (*usb_cx2_cx_hook)(bool done, bool stall) = nullptr;
++void (*usb_cx2_reg_hook)(uint32_t off, uint32_t old, uint32_t value) = nullptr;
++bool (*usb_cx2_drained_hook)(int fifo) = nullptr;
++bool usb_cx2_host_mode = false;
++
++/* MSC host harness: put OUT data into the endpoint's FIFO like real hardware
++   (OUT interrupt per full block, SPK for a short packet), no NavNet quirks. */
++bool usb_cx2_host_out(uint8_t ep, const uint8_t *packet, size_t size)
++{
++    uint8_t fifo = (usb_cx2.epmap[ep > 4] >> (8 * ((ep - 1) & 0b11) + 4)) & 0b11;
++    if(size > sizeof(usb_cx2.fifo[fifo].data) - usb_cx2.fifo[fifo].size)
++        return false;
++    memcpy(&usb_cx2.fifo[fifo].data[usb_cx2.fifo[fifo].size], packet, size);
++    usb_cx2.fifo[fifo].size += size;
++    usb_cx2.gisr[1] |= 1 << (fifo * 2);
++    auto packet_size = usb_cx2.epout[(ep - 1) & 7] & 0x7ff;
++    if(!packet_size || size % packet_size)
++        usb_cx2.gisr[1] |= 1 << ((fifo * 2) + 1);
++    usb_cx2_int_check();
++    return true;
++}
++
++
+ 
+ static void usb_cx2_int_check()
+ {
+@@ -98,6 +125,12 @@ bool usb_cx2_packet_to_calc(uint8_t ep, const uint8_t *packet, size_t size)
+ 
+ static void usb_cx2_packet_from_calc(uint8_t ep, uint8_t *packet, size_t size)
+ {
++    if(usb_cx2_trace) {
++        printf("[usb from calc ep%d len %u:", ep, (unsigned)size);
++        for(size_t i = 0; i < size && i < 64; ++i) printf(" %02x", packet[i]);
++        printf("]\n");
++    }
++    if(usb_cx2_host_hook && (usb_cx2_host_mode || ep != 1)) { usb_cx2_host_hook(ep, packet, size); return; }
+     if(ep != 1)
+         error("Got packet on unknown EP");
+ 
+@@ -206,7 +239,9 @@ void usb_cx2_fdma_update(int fdma)
+         {
+             usb_cx2.gisr[1] &= ~(0b11 << (fifo * 2)); // FIFO0 OUT/SPK
+ 
+-            if(ep == 1 && send_queue.size())
++            if(usb_cx2_drained_hook && usb_cx2_drained_hook(fifo))
++                ;
++            else if(ep == 1 && send_queue.size())
+             {
+                 usb_cx2_packet_to_calc(1, send_queue.front().data, send_queue.front().size);
+                 send_queue.pop();
+@@ -218,7 +253,20 @@ void usb_cx2_fdma_update(int fdma)
+     usb_cx2_int_check();
+ }
+ 
++static uint32_t usb_cx2_read_word_real(uint32_t addr);
+ uint32_t usb_cx2_read_word(uint32_t addr)
++{
++    uint32_t v = usb_cx2_read_word_real(addr);
++    if(usb_cx2_trace > 1) {
++        static uint32_t last_off = ~0u, last_v; static int repeat;
++        uint32_t off = addr & 0xFFF;
++        if(off == last_off && v == last_v) { repeat++; }
++        else { if(repeat) printf("[usbr x%d]\n", repeat); repeat = 0; printf("[usbr %03x=%08x]\n", off, v); }
++        last_off = off; last_v = v;
++    }
++    return v;
++}
++static uint32_t usb_cx2_read_word_real(uint32_t addr)
+ {
+     uint32_t offset = addr & 0xFFF;
+     switch(offset)
+@@ -255,6 +303,8 @@ uint32_t usb_cx2_read_word(uint32_t addr)
+         return usb_cx2.devaddr;
+     case 0x108:
+         return usb_cx2.devtest;
++    case 0x110:
++        return 0x44c;
+     case 0x114:
+         return usb_cx2.phytest;
+     case 0x120:
+@@ -336,6 +386,7 @@ uint32_t usb_cx2_read_word(uint32_t addr)
+ void usb_cx2_write_word(uint32_t addr, uint32_t value)
+ {
+     uint32_t offset = addr & 0xFFF;
++    if(usb_cx2_trace) printf("[usbw %03x=%08x pc=%08x lr=%08x sp=%08x cpsr=%02x r0=%08x]\n", offset, value, arm.reg[15], arm.reg[14], arm.reg[13], arm.cpsr_low28 & 0xff, arm.reg[0]);
+     switch(offset)
+     {
+     case 0x000: // CAPLENGTH + HCIVERSION
+@@ -401,15 +452,27 @@ void usb_cx2_write_word(uint32_t addr, uint32_t value)
+     case 0x110: // SOF mask timer
+         return;
+     case 0x114:
++    {
++        uint32_t old = usb_cx2.phytest;
+         usb_cx2.phytest = value;
++        if(usb_cx2_reg_hook) usb_cx2_reg_hook(offset, old, value);
+         return;
++    }
+     case 0x120:
+     {
+         if (value & 0b1000) // Clear CX FIFO
+             usb_cx2.cxfifo.size = 0;
+ 
+         if (value & 0b0100) // Stall CX FIFO
+-            error("control endpoint stall");
++        {
++            if(!usb_cx2_host_mode && !usb_cx2_cx_hook)
++                error("control endpoint stall");
++            usb_cx2.gisr[0] &= ~0b111;
++            usb_cx2_int_check();
++            if(usb_cx2_cx_hook)
++                usb_cx2_cx_hook(false, true);
++            return;
++        }
+ 
+         if (value & 0b0010) // Test transfer finished
+             error("test transfer finished");
+@@ -420,7 +483,9 @@ void usb_cx2_write_word(uint32_t addr, uint32_t value)
+             usb_cx2.gisr[0] &= ~0b111;
+             usb_cx2_int_check();
+ 
+-            if (usb_cx2.devaddr == 1)
++            if(usb_cx2_cx_hook)
++                usb_cx2_cx_hook(true, false);
++            if (!usb_cx2_host_mode && usb_cx2.devaddr == 1)
+             {
+                 struct usb_setup packet = { 0, 9, 1, 0, 0 };
+                 usb_cx2_receive_setup_packet(&packet);
+@@ -450,16 +515,28 @@ void usb_cx2_write_word(uint32_t addr, uint32_t value)
+             error("Not implemented");
+         usb_cx2_int_check();
+         return;
+-    case 0x154: // Tx zero length pkt
++    case 0x154: // Tx zero length pkt (status; written back with bits cleared)
+         usb_cx2.txzlp = value;
+-        if(value)
+-            error("Not implemented");
+         usb_cx2_int_check();
+         return;
+     case 0x160: case 0x164:
+     case 0x168: case 0x16c:
++    {
++        uint32_t old = usb_cx2.epin[(offset - 0x160) >> 2];
++        if((value & 0x8000) && usb_cx2_host_hook) {
++            /* TX0BYTE: the controller sends a zero-length packet on this IN
++               endpoint, reports it in the TX0BYTE register and clears the bit. */
++            unsigned ep = ((offset - 0x160) >> 2) + 1;
++            value &= ~0x8000u;
++            usb_cx2.txzlp |= 1u << (ep - 1);
++            usb_cx2.epin[ep - 1] = value;
++            usb_cx2_host_hook(ep, nullptr, 0);
++            return;
++        }
+         usb_cx2.epin[(offset - 0x160) >> 2] = value;
++        if(usb_cx2_reg_hook) usb_cx2_reg_hook(offset, old, value);
+         return;
++    }
+     case 0x180: case 0x184:
+     case 0x188: case 0x18c:
+         usb_cx2.epout[(offset - 0x180) >> 2] = value;
+diff --git a/core/usb_cx2.h b/core/usb_cx2.h
+index ef3f5ff..b16a7b5 100644
+--- a/core/usb_cx2.h
++++ b/core/usb_cx2.h
+@@ -65,6 +65,13 @@ typedef struct usb_cx2_state {
+ extern struct usb_cx2_state usb_cx2;
+ 
+ void usb_cx2_reset(void);
++extern int usb_cx2_trace;
++extern void (*usb_cx2_host_hook)(uint8_t ep, const uint8_t *data, size_t size);
++extern void (*usb_cx2_cx_hook)(bool done, bool stall);
++extern void (*usb_cx2_reg_hook)(uint32_t off, uint32_t old, uint32_t value);
++extern bool (*usb_cx2_drained_hook)(int fifo);
++extern bool usb_cx2_host_mode;
++bool usb_cx2_host_out(uint8_t ep, const uint8_t *packet, size_t size);
+ 
+ typedef struct emu_snapshot emu_snapshot;
+ bool usb_cx2_suspend(emu_snapshot *snapshot);
+diff --git a/headless/Makefile b/headless/Makefile
+index 28833d8..4f0ee65 100644
+--- a/headless/Makefile
++++ b/headless/Makefile
+@@ -48,7 +48,7 @@ CSOURCES   += ../core/armsnippets_loader.c ../core/casplus.c ../core/des.c ../co
+ 
+ CPPSOURCES += ../core/arm_interpreter.cpp ../core/coproc.cpp ../core/cpu.cpp ../core/debug.cpp ../core/emu.cpp \
+               ../core/flash.cpp ../core/gif.cpp ../core/thumb_interpreter.cpp ../core/usblink_queue.cpp main.cpp \
+-              ../core/keypad.cpp ../core/cx2.cpp ../core/usb_cx2.cpp ../core/usblink_cx2.cpp ../core/fieldparser.cpp
++              ../core/keypad.cpp ../core/cx2.cpp ../core/usb_cx2.cpp ../core/usblink_cx2.cpp ../core/usbmsc_host.cpp ../core/fieldparser.cpp
+ 
+ OBJS = $(patsubst %.S, %.o, $(ASMSOURCES))
+ OBJS += $(patsubst %.c, %.o, $(CSOURCES))
+@@ -70,3 +70,7 @@ $(OUTPUT): $(OBJS)
+ 
+ clean:
+ 	rm -f $(OBJS) $(OUTPUT)
++
++FBCTL_OBJS = $(filter-out main.o,$(OBJS)) fbctl.o
++fbctl: $(FBCTL_OBJS)
++	$(CXX) $(CXXFLAGS) $(LFLAGS) $^ $(LIBS) -o $@
+diff --git a/core/usbmsc_host.cpp b/core/usbmsc_host.cpp
+new file mode 100644
+index 0000000..bd68a20
+--- /dev/null
++++ b/core/usbmsc_host.cpp
+@@ -0,0 +1,550 @@
++/* Emulated USB mass storage host ("the computer") for testing calculator-side
++ * USB device code in Firebird. Drives the CX II controller model as a host
++ * would: bus reset, enumeration, Bulk-Only Transport, stalls. Driven by fbctl
++ * "msc ..." commands. Not part of upstream Firebird. */
++#include <cstdio>
++#include <cstring>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "emu.h"
++#include "usb.h"
++#include "usb_cx2.h"
++#include "usblink.h"
++#include "usblink_cx2.h"
++#include "usbmsc_host.h"
++
++struct Txn {
++    enum Kind { CTRL_IN, CTRL_NODATA, BULK_OUT, BULK_IN, DELAY, ACTION } kind;
++    usb_setup setup{};
++    std::vector<uint8_t> data;
++    uint32_t expect = 0, sent = 0;
++    int ticks = 0;
++    std::function<void()> action;
++    std::function<void(Txn &, int)> done;      /* status: 0 ok, 1 stall, 2 timeout */
++};
++
++int usbmsc_busy = 0;
++static std::deque<Txn> q;
++static bool running, armed, hooked;
++static int timeout_ticks;
++static uint32_t tag = 1;
++static uint32_t sectors;
++static uint8_t addr = 7;
++static bool enumerated, waiting;
++static bool composite;        /* TI link on EP1 stays with usblink; MSC on EP2 */
++static uint8_t msc_ep = 1;
++
++static void start_front();
++static void on_packet(uint8_t ep, const uint8_t *d, size_t n);
++/* Packets the device has ready before the host asks: on a real bus they wait
++   in the device (NAK) until the host's next IN transfer. */
++static std::deque<std::vector<uint8_t>> early;
++
++static void flush_queue(const char *why) {
++    printf("[msc abort: %s, %zu queued]\n", why, q.size());
++    q.clear();
++    running = false;
++    usbmsc_busy = 0;
++}
++
++static void finish(int status) {
++    if (q.empty()) { running = false; return; }
++    Txn t = std::move(q.front());
++    q.pop_front();
++    running = false;
++    if (t.done) t.done(t, status);
++    start_front();
++}
++
++static void push_out() {
++    Txn &t = q.front();
++    size_t n = t.data.size() - t.sent;
++    if (n > 512) n = 512;
++    if (!usb_cx2_host_out(msc_ep, t.data.data() + t.sent, n)) return;   /* wait for drain */
++    t.sent += n;
++}
++
++static void start_front() {
++    while (!running && !q.empty()) {
++        running = true;
++        timeout_ticks = 500;
++        Txn &t = q.front();
++        switch (t.kind) {
++        case Txn::CTRL_IN:
++        case Txn::CTRL_NODATA:
++            usb_cx2_receive_setup_packet(&t.setup);
++            return;
++        case Txn::BULK_OUT:
++            push_out();
++            return;
++        case Txn::BULK_IN:
++            while (running && !q.empty() && q.front().kind == Txn::BULK_IN && !early.empty()) {
++                std::vector<uint8_t> pkt = std::move(early.front());
++                early.pop_front();
++                size_t before = q.size();
++                on_packet(msc_ep, pkt.data(), pkt.size());
++                if (q.size() != before) return;             /* that transfer finished */
++            }
++            return;
++        case Txn::DELAY:
++            return;
++        case Txn::ACTION:
++            if (t.action) t.action();
++            finish(0);
++            return;     /* finish() already started the next one */
++        }
++    }
++}
++
++static void enqueue(Txn t) {
++    q.push_back(std::move(t));
++    start_front();
++}
++
++/* ---------------------------------------------------------------- hooks */
++
++static void on_packet(uint8_t ep, const uint8_t *d, size_t n) {
++    if (composite && ep == 1) { usblink_cx2_handle_packet(d, n); return; }
++    if (ep != 0 && (!running || q.empty() || q.front().kind != Txn::BULK_IN)) {
++        early.emplace_back(d, d + n);       /* waits in the device until the host asks */
++        return;
++    }
++    if (!running || q.empty()) { printf("[msc unexpected data ep%d %zu bytes]\n", ep, n); return; }
++    Txn &t = q.front();
++    if (ep == 0 && t.kind == Txn::CTRL_IN) { t.data.insert(t.data.end(), d, d + n); return; }
++    if (ep != 0 && t.kind == Txn::BULK_IN) {
++        t.data.insert(t.data.end(), d, d + n);
++        if (t.data.size() >= t.expect || n % 64 || n == 0) finish(0);   /* short or zero-length packet */
++        return;
++    }
++    printf("[msc unexpected data ep%d %zu bytes during txn %d]\n", ep, n, (int)t.kind);
++}
++
++static void on_cx(bool done, bool stall) {
++    (void)done;
++    if (!running || q.empty()) { if (!composite) printf("[msc unexpected cx %s]\n", stall ? "stall" : "done"); return; }
++    Txn &t = q.front();
++    if (t.kind == Txn::CTRL_IN || t.kind == Txn::CTRL_NODATA) finish(stall ? 1 : 0);
++    else printf("[msc cx %s during txn %d]\n", stall ? "stall" : "done", (int)t.kind);
++}
++
++static bool on_drained(int fifo) {
++    if (composite && fifo != 2) return false;   /* the TI link's FIFO */
++    if (!running || q.empty()) return true;
++    Txn &t = q.front();
++    if (t.kind != Txn::BULK_OUT) return true;
++    if (t.sent >= t.data.size()) finish(0);
++    else push_out();
++    return true;
++}
++
++static void enumerate();
++
++static void on_reg(uint32_t off, uint32_t old, uint32_t v) {
++    if (off == 0x114) {
++        if ((old & 1) && !(v & 1)) {
++            printf("[msc device attached]\n");
++            if (armed) { armed = false; enumerate(); }
++        } else if (!(old & 1) && (v & 1)) {
++            printf("[msc device detached]\n");
++        }
++    } else if (off == 0x160 && (v & 0x800) && !(old & 0x800)) {
++        if (running && !q.empty() && q.front().kind == Txn::BULK_IN) finish(1);
++        else printf("[msc IN stall]\n");
++    }
++}
++
++void usbmsc_host_timer() {
++    if (!hooked || !running || q.empty()) return;
++    Txn &t = q.front();
++    if (t.kind == Txn::DELAY) { if (--t.ticks <= 0) finish(0); return; }
++    if (--timeout_ticks <= 0) {
++        int kind = (int)t.kind;
++        printf("[msc timeout in txn %d]\n", kind);
++        finish(2);
++    }
++}
++
++/* ---------------------------------------------------------------- helpers */
++
++static std::string hex(const std::vector<uint8_t> &d, size_t max = 64) {
++    std::string s;
++    char b[4];
++    for (size_t i = 0; i < d.size() && i < max; ++i) { snprintf(b, sizeof b, "%02x", d[i]); s += b; }
++    return s;
++}
++
++static void ctrl(uint8_t type, uint8_t req, uint16_t value, uint16_t index, uint16_t length,
++                 std::function<void(Txn &, int)> done) {
++    Txn t;
++    t.kind = (type & 0x80) ? Txn::CTRL_IN : Txn::CTRL_NODATA;
++    t.setup = {type, req, value, index, length};
++    t.done = done;
++    enqueue(std::move(t));
++}
++
++static void delay(int ticks) { Txn t; t.kind = Txn::DELAY; t.ticks = ticks; enqueue(std::move(t)); }
++static void action(std::function<void()> f) { Txn t; t.kind = Txn::ACTION; t.action = f; enqueue(std::move(t)); }
++
++typedef std::function<void(int status, uint32_t residue, std::vector<uint8_t> &data)> BotDone;
++
++/* One Bulk-Only command. dir: 1 in, 0 out/none. */
++static void bot(const std::vector<uint8_t> &cdb, uint32_t len, bool in, std::vector<uint8_t> out, BotDone done) {
++    auto data = std::make_shared<std::vector<uint8_t>>();
++    std::vector<uint8_t> cbw(31, 0);
++    memcpy(cbw.data(), "USBC", 4);
++    uint32_t mytag = tag++;
++    memcpy(&cbw[4], &mytag, 4);
++    memcpy(&cbw[8], &len, 4);
++    cbw[12] = in ? 0x80 : 0;
++    cbw[14] = (uint8_t)cdb.size();
++    memcpy(&cbw[15], cdb.data(), cdb.size());
++    Txn c; c.kind = Txn::BULK_OUT; c.data = cbw;
++    c.done = [](Txn &, int st) { if (st) printf("[msc CBW failed %d]\n", st); };
++    enqueue(std::move(c));
++    auto csw = [mytag, data, done](Txn &t, int st) {
++        if (st == 2 || t.data.size() != 13 || memcmp(t.data.data(), "USBS", 4)) {
++            printf("[msc bad CSW st=%d len=%zu %s]\n", st, t.data.size(), hex(t.data).c_str());
++            done(-1, 0, *data);
++            return;
++        }
++        uint32_t rtag, residue;
++        memcpy(&rtag, &t.data[4], 4);
++        memcpy(&residue, &t.data[8], 4);
++        if (rtag != mytag) printf("[msc CSW tag mismatch]\n");
++        done(t.data[12], residue, *data);
++    };
++    auto queue_csw = [csw](bool front) {
++        Txn s; s.kind = Txn::BULK_IN; s.expect = 13; s.done = csw;
++        if (front) q.push_front(std::move(s)); else q.push_back(std::move(s));
++    };
++    if (len && in) {
++        Txn d; d.kind = Txn::BULK_IN; d.expect = len;
++        d.done = [data, queue_csw](Txn &t, int st) {
++            *data = t.data;
++            if (st == 1) {
++                /* Stalled: clear the halt, then read the CSW. */
++                queue_csw(true);
++                Txn c; c.kind = Txn::CTRL_NODATA; c.setup = {0x02, 1, 0, 0x81, 0};
++                c.done = [](Txn &, int s2) { if (s2) printf("[msc clear halt failed %d]\n", s2); };
++                q.push_front(std::move(c));
++            } else queue_csw(true);
++        };
++        enqueue(std::move(d));
++    } else {
++        if (len && !in) {
++            Txn d; d.kind = Txn::BULK_OUT; d.data = out; d.data.resize(len);
++            enqueue(std::move(d));
++        }
++        Txn s; s.kind = Txn::BULK_IN; s.expect = 13; s.done = csw;
++        enqueue(std::move(s));
++    }
++}
++
++static void be32(std::vector<uint8_t> &c, int at, uint32_t v) {
++    c[at] = v >> 24; c[at + 1] = v >> 16; c[at + 2] = v >> 8; c[at + 3] = v;
++}
++
++static void report(const char *name, int st, uint32_t residue, std::vector<uint8_t> &d) {
++    printf("[msc %s status=%d residue=%u len=%zu data=%s]\n", name, st, residue, d.size(), hex(d).c_str());
++}
++
++static void done_busy() { action([] { if (usbmsc_busy > 0) --usbmsc_busy; }); }
++
++static void enumerate() {
++    action([] { usb_cx2_bus_reset_on(); });
++    delay(2);
++    action([] { usb_cx2_bus_reset_off(); });
++    delay(2);
++    auto show = [](const char *what) {
++        return [what](Txn &t, int st) { printf("[msc %s st=%d len=%zu %s]\n", what, st, t.data.size(), hex(t.data).c_str()); };
++    };
++    ctrl(0x80, 6, 0x0100, 0, 64, [](Txn &t, int st) {
++        printf("[msc device st=%d len=%zu %s]\n", st, t.data.size(), hex(t.data).c_str());
++        if (t.data.size() >= 12 && t.data[8] == 0x51 && t.data[9] == 0x04) {
++            /* The TI OS itself (re)attached, not the drive: wait for the next attach. */
++            printf("[msc TI link device; still waiting for the drive]\n");
++            q.clear();
++            running = false;
++            armed = true;
++        }
++    });
++    ctrl(0x00, 5, addr, 0, 0, show("set_address"));
++    ctrl(0x80, 6, 0x0200, 0, 9, show("config9"));
++    ctrl(0x80, 6, 0x0200, 0, 255, show("config"));
++    ctrl(0x80, 6, 0x0300, 0, 255, show("string0"));
++    ctrl(0x80, 6, 0x0301, 0x409, 255, show("string1"));
++    ctrl(0x80, 6, 0x0302, 0x409, 255, show("string2"));
++    ctrl(0x80, 6, 0x0303, 0x409, 255, show("string3"));
++    ctrl(0x80, 6, 0x0600, 0, 10, show("qualifier"));
++    ctrl(0x00, 9, 1, 0, 0, show("set_config"));
++    ctrl(0xa1, 0xfe, 0, 0, 1, show("max_lun"));
++    bot({0x12, 0, 0, 0, 36, 0}, 36, true, {}, [](int s, uint32_t r, std::vector<uint8_t> &d) { report("inquiry", s, r, d); });
++    bot({0x00, 0, 0, 0, 0, 0}, 0, false, {}, [](int s, uint32_t r, std::vector<uint8_t> &d) { report("tur", s, r, d); });
++    bot({0x23, 0, 0, 0, 0, 0, 0, 0, 0xfc, 0}, 0xfc, true, {}, [](int s, uint32_t r, std::vector<uint8_t> &d) { report("format_capacities", s, r, d); });
++    bot({0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 8, true, {}, [](int s, uint32_t r, std::vector<uint8_t> &d) {
++        report("capacity", s, r, d);
++        if (d.size() == 8) sectors = ((uint32_t)d[0] << 24 | d[1] << 16 | d[2] << 8 | d[3]) + 1;
++        printf("[msc sectors %u]\n", sectors);
++    });
++    bot({0x1a, 0, 0x3f, 0, 192, 0}, 192, true, {}, [](int s, uint32_t r, std::vector<uint8_t> &d) { report("mode_sense", s, r, d); });
++    bot({0xd5, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 64, true, {}, [](int s, uint32_t r, std::vector<uint8_t> &d) { report("unknown_cmd", s, r, d); });
++    bot({0x03, 0, 0, 0, 18, 0}, 18, true, {}, [](int s, uint32_t r, std::vector<uint8_t> &d) { report("sense", s, r, d); });
++    action([] {
++        printf("[msc enumerated]\n");
++        enumerated = true;
++        if (waiting) { waiting = false; if (usbmsc_busy > 0) --usbmsc_busy; }
++    });
++}
++
++static void hook(bool on) {
++    usb_cx2_host_mode = on && !composite;
++    usb_cx2_host_hook = on ? on_packet : nullptr;
++    usb_cx2_cx_hook = on ? on_cx : nullptr;
++    usb_cx2_reg_hook = on ? on_reg : nullptr;
++    usb_cx2_drained_hook = on ? on_drained : nullptr;
++    hooked = on;
++}
++
++/* Read/write a list of sector ranges between the device and an image file. */
++static void transfer_map(const std::string &map, const std::string &img, bool write) {
++    FILE *m = fopen(map.c_str(), "r");
++    if (!m) { printf("[msc cannot open %s]\n", map.c_str()); return; }
++    FILE *f = fopen(img.c_str(), write ? "rb" : "r+b");
++    if (!f && !write) f = fopen(img.c_str(), "w+b");
++    if (!f) { fclose(m); printf("[msc cannot open %s]\n", img.c_str()); return; }
++    auto file = std::shared_ptr<FILE>(f, fclose);
++    auto failures = std::make_shared<int>(0);
++    auto total = std::make_shared<uint32_t>(0);
++    unsigned lba, count;
++    ++usbmsc_busy;
++    while (fscanf(m, "%u %u", &lba, &count) == 2) {
++        while (count) {
++            uint32_t n = count > 128 ? 128 : count;
++            std::vector<uint8_t> cdb(10, 0);
++            cdb[0] = write ? 0x2a : 0x28;
++            be32(cdb, 2, lba);
++            cdb[7] = n >> 8; cdb[8] = n;
++            std::vector<uint8_t> out;
++            if (write) {
++                out.resize(n * 512);
++                fseek(f, (long)lba * 512, SEEK_SET);
++                if (fread(out.data(), 512, n, f) != n) printf("[msc short image read at %u]\n", lba);
++            }
++            uint32_t at = lba;
++            bot(cdb, n * 512, !write, out, [file, at, n, write, failures, total](int s, uint32_t r, std::vector<uint8_t> &d) {
++                if (s != 0 || r != 0) { ++*failures; printf("[msc %s lba %u status=%d residue=%u]\n", write ? "write" : "read", at, s, r); }
++                if (!write && d.size() == n * 512) {
++                    fseek(file.get(), (long)at * 512, SEEK_SET);
++                    fwrite(d.data(), 512, n, file.get());
++                }
++                *total += n;
++            });
++            lba += n;
++            count -= n;
++        }
++    }
++    fclose(m);
++    action([failures, total, write] {
++        fflush(nullptr);
++        printf("[msc %smap done %u sectors, %d failures]\n", write ? "write" : "read", *total, *failures);
++    });
++    done_busy();
++}
++
++bool usbmsc_command(const char *line) {
++    char cmd[32] = "", a[512] = "", b[512] = "", c[64] = "";
++    int n = sscanf(line, "%*s %31s %511s %511s %63s", cmd, a, b, c);
++    std::string s = cmd;
++    if (s == "arm") {
++        usblink_reset();
++        hook(true);
++        armed = true;
++        enumerated = false;
++        if (!(usb_cx2.phytest & 1)) printf("[msc armed; waiting for a soft reconnect]\n");
++    } else if (s == "attach2") {
++        /* Composite: the TI link (usblink) is already connected; talk to the
++           mass storage interface on EP2 next to it. */
++        composite = true;
++        msc_ep = 2;
++        hook(true);
++        enumerated = false;
++        waiting = true;
++        ++usbmsc_busy;
++        auto show = [](const char *what) {
++            return [what](Txn &t, int st) { printf("[msc %s st=%d len=%zu %s]\n", what, st, t.data.size(), hex(t.data).c_str()); };
++        };
++        ctrl(0x80, 6, 0x0100, 0, 18, show("device"));
++        ctrl(0x80, 6, 0x0200, 0, 9, show("config9"));
++        ctrl(0x80, 6, 0x0200, 0, 255, show("config"));
++        ctrl(0xa1, 0xfe, 0, 1, 1, show("max_lun"));
++        bot({0x12, 0, 0, 0, 36, 0}, 36, true, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) { report("inquiry", st2, r, d); });
++        bot({0x00, 0, 0, 0, 0, 0}, 0, false, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) { report("tur", st2, r, d); });
++        bot({0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 8, true, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) {
++            report("capacity", st2, r, d);
++            if (d.size() == 8) sectors = ((uint32_t)d[0] << 24 | d[1] << 16 | d[2] << 8 | d[3]) + 1;
++            printf("[msc sectors %u]\n", sectors);
++        });
++        bot({0xd5, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 64, true, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) { report("unknown_cmd", st2, r, d); });
++        bot({0x03, 0, 0, 0, 18, 0}, 18, true, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) { report("sense", st2, r, d); });
++        action([] {
++            printf("[msc enumerated]\n");
++            enumerated = true;
++            if (waiting) { waiting = false; if (usbmsc_busy > 0) --usbmsc_busy; }
++        });
++    } else if (s == "tur") {
++        ++usbmsc_busy;
++        bot({0x00, 0, 0, 0, 0, 0}, 0, false, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) { report("tur", st2, r, d); });
++        bot({0x03, 0, 0, 0, 18, 0}, 18, true, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) { report("sense", st2, r, d); });
++        bot({0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 8, true, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) {
++            report("capacity", st2, r, d);
++            if (d.size() == 8) printf("[msc sectors %u]\n", ((uint32_t)d[0] << 24 | d[1] << 16 | d[2] << 8 | d[3]) + 1);
++        });
++        done_busy();
++    } else if (s == "wait") {
++        if (!enumerated) { waiting = true; ++usbmsc_busy; }
++    } else if (s == "off") {
++        hook(false);
++        q.clear();
++        running = false;
++        usbmsc_busy = 0;
++    } else if (s == "readmap" && n >= 3) transfer_map(a, b, false);
++    else if (s == "writemap" && n >= 3) transfer_map(a, b, true);
++    else if (s == "eject") {
++        ++usbmsc_busy;
++        bot({0x1e, 0, 0, 0, 0, 0}, 0, false, {}, [](int st, uint32_t r, std::vector<uint8_t> &d) { report("allow", st, r, d); });
++        bot({0x1b, 0, 0, 0, 0x02, 0}, 0, false, {}, [](int st, uint32_t r, std::vector<uint8_t> &d) { report("eject", st, r, d); });
++        done_busy();
++    } else if (s == "cmd" && n >= 3) {
++        /* msc cmd HEXCDB LEN in|out|none */
++        std::vector<uint8_t> cdb;
++        for (size_t i = 0; i + 1 < strlen(a); i += 2) { unsigned v; sscanf(a + i, "%2x", &v); cdb.push_back((uint8_t)v); }
++        uint32_t len = (uint32_t)strtoul(b, nullptr, 0);
++        bool in = !strcmp(c, "in");
++        ++usbmsc_busy;
++        std::vector<uint8_t> out(len, 0x5a);
++        bot(cdb, len, in, out, [](int st, uint32_t r, std::vector<uint8_t> &d) { report("cmd", st, r, d); });
++        done_busy();
++    } else if (s == "badcbw") {
++        /* An invalid CBW must stall both pipes until a Bulk-Only reset. */
++        ++usbmsc_busy;
++        Txn t; t.kind = Txn::BULK_OUT; t.data.assign(31, 0x11);
++        enqueue(std::move(t));
++        delay(5);
++        action([] { printf("[msc after bad cbw: in_stall=%d out_stall=%d]\n", !!(usb_cx2.epin[0] & 0x800), !!(usb_cx2.epout[0] & 0x800)); });
++        ctrl(0x21, 0xff, 0, 0, 0, [](Txn &, int st) { printf("[msc bot reset st=%d]\n", st); });
++        ctrl(0x02, 1, 0, 0x81, 0, [](Txn &, int st) { printf("[msc clear in st=%d]\n", st); });
++        ctrl(0x02, 1, 0, 0x01, 0, [](Txn &, int st) { printf("[msc clear out st=%d]\n", st); });
++        action([] { printf("[msc after reset: in_stall=%d out_stall=%d]\n", !!(usb_cx2.epin[0] & 0x800), !!(usb_cx2.epout[0] & 0x800)); });
++        bot({0x00, 0, 0, 0, 0, 0}, 0, false, {}, [](int st, uint32_t r, std::vector<uint8_t> &d) { report("tur", st, r, d); });
++        done_busy();
++    } else if (s == "replug") {
++        /* Cable back in, a computer enumerates the TI device (no MSC host). */
++        hook(false);
++        usb_cx2_bus_reset_on();
++        usb_cx2_bus_reset_off();
++        usb_setup p = {0, 5, 9, 0, 0};
++        usb_cx2_receive_setup_packet(&p);
++        printf("[msc replugged: SET_ADDRESS 9 sent]\n");
++    } else if (s == "unplug") {
++        /* Session end as the OTG block reports it: VBUS invalid, B-session
++           end, latched OTG status (Firebird's own disconnect sequence). */
++        usb_cx2_bus_reset_on();
++        usb_cx2.gisr[2] |= 1 << 1;          /* no more SOFs: suspend */
++        printf("[msc cable unplugged]\n");
++    } else if (s == "attach3") {
++        /* Composite with an MTP interface: the TI link (usblink) stays on EP1;
++           raw bulk transfers on EP2 ("out FILE", "in FILE") carry MTP. */
++        composite = true;
++        msc_ep = 2;
++        hook(true);
++        waiting = true;
++        ++usbmsc_busy;
++        auto show = [](const char *what) {
++            return [what](Txn &t, int st) { printf("[mtp %s st=%d len=%zu %s]\n", what, st, t.data.size(), hex(t.data).c_str()); };
++        };
++        ctrl(0x80, 6, 0x0100, 0, 18, show("device"));
++        ctrl(0x80, 6, 0x0200, 0, 9, show("config9"));
++        ctrl(0x80, 6, 0x0200, 0, 255, show("config"));
++        ctrl(0x80, 6, 0x0300, 0, 255, show("langids"));
++        ctrl(0x80, 6, 0x0310, 0x0409, 255, show("string16"));
++        ctrl(0x80, 6, 0x0301, 0x0409, 255, show("string1"));
++        action([] {
++            printf("[mtp attached]\n");
++            enumerated = true;
++            if (waiting) { waiting = false; if (usbmsc_busy > 0) --usbmsc_busy; }
++        });
++    } else if (s == "out" && n >= 2) {
++        /* One bulk OUT transfer with the contents of a file. */
++        std::vector<uint8_t> data;
++        if (FILE *f = fopen(a, "rb")) { int c; while ((c = fgetc(f)) != EOF) data.push_back((uint8_t)c); fclose(f); }
++        size_t len = data.size();
++        waiting = true;
++        ++usbmsc_busy;
++        Txn t; t.kind = Txn::BULK_OUT; t.data = std::move(data);
++        t.done = [len](Txn &, int st) {
++            printf("[mtp out %zu st=%d]\n", len, st);
++            if (waiting) { waiting = false; if (usbmsc_busy > 0) --usbmsc_busy; }
++        };
++        enqueue(std::move(t));
++    } else if (s == "in" && n >= 2) {
++        /* One bulk IN transfer (until a short or zero-length packet) into a file. */
++        std::string path = a;
++        waiting = true;
++        ++usbmsc_busy;
++        Txn t; t.kind = Txn::BULK_IN; t.expect = 0xffffffffu;
++        t.done = [path](Txn &tx, int st) {
++            if (FILE *f = fopen(path.c_str(), "wb")) { fwrite(tx.data.data(), 1, tx.data.size(), f); fclose(f); }
++            printf("[mtp in %zu st=%d]\n", tx.data.size(), st);
++            if (waiting) { waiting = false; if (usbmsc_busy > 0) --usbmsc_busy; }
++        };
++        enqueue(std::move(t));
++    } else if (s == "replug2") {
++        /* Composite: cable back in after "unplug"; a computer enumerates the
++           TI device again and talks to the drive interface next to it. */
++        composite = true;
++        msc_ep = 2;
++        hook(true);
++        waiting = true;
++        ++usbmsc_busy;
++        enumerated = false;
++        auto show = [](const char *what) {
++            return [what](Txn &t, int st) { printf("[msc %s st=%d len=%zu %s]\n", what, st, t.data.size(), hex(t.data).c_str()); };
++        };
++        action([] { usb_cx2_bus_reset_on(); });
++        delay(2);
++        action([] { usb_cx2_bus_reset_off(); });
++        delay(2);
++        ctrl(0x00, 5, addr, 0, 0, show("set_address"));
++        ctrl(0x80, 6, 0x0200, 0, 255, show("config"));
++        ctrl(0x00, 9, 1, 0, 0, show("set_config"));
++        delay(50);
++        if (strcmp(a, "mtp")) {     /* "replug2 mtp": no SCSI commands */
++            bot({0x00, 0, 0, 0, 0, 0}, 0, false, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) { report("tur", st2, r, d); });
++            bot({0x00, 0, 0, 0, 0, 0}, 0, false, {}, [](int st2, uint32_t r, std::vector<uint8_t> &d) { report("tur", st2, r, d); });
++        }
++        action([] {
++            printf("[msc enumerated]\n");
++            enumerated = true;
++            if (waiting) { waiting = false; if (usbmsc_busy > 0) --usbmsc_busy; }
++        });
++    } else if (s == "busreset") {
++        waiting = true;
++        ++usbmsc_busy;
++        armed = false;
++        enumerated = false;
++        action([] { usb_cx2_bus_reset_on(); });
++        delay(2);
++        action([] { usb_cx2_bus_reset_off(); });
++        delay(2);
++        enumerate();
++    } else {
++        printf("[msc unknown %s]\n", cmd);
++        return false;
++    }
++    return true;
++}
+diff --git a/core/usbmsc_host.h b/core/usbmsc_host.h
+new file mode 100644
+index 0000000..2fab0e7
+--- /dev/null
++++ b/core/usbmsc_host.h
+@@ -0,0 +1,6 @@
++#ifndef USBMSC_HOST_H
++#define USBMSC_HOST_H
++extern int usbmsc_busy;
++bool usbmsc_command(const char *line);
++void usbmsc_host_timer();
++#endif
